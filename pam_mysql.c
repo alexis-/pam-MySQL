@@ -168,7 +168,9 @@
 #define PAM_AUTHTOK_RECOVERY_ERR PAM_AUTHTOK_RECOVER_ERR
 #endif
 
-#ifndef my_make_scrambled_password
+#ifdef HAVE_MY_MAKE_SCRAMBLED_PASSWORD
+void my_make_scrambled_password(char scrambled_password[42], const char password[255], int len);
+#else
 #include "crypto.h"
 #include "crypto-sha1.h"
 
@@ -958,6 +960,10 @@ static pam_mysql_err_t pam_mysql_crypt_opt_getter(void *val, const char **pretva
       *pretval = "joomla15";
       break;
 
+    case 7:
+      *pretval = "salted_sha512";
+      break;
+
     default:
       *pretval = NULL;
   }
@@ -1001,6 +1007,11 @@ static pam_mysql_err_t pam_mysql_crypt_opt_setter(void *val, const char *newval_
 
   if (strcmp(newval_str, "6") == 0 || strcasecmp(newval_str, "joomla15") == 0) {
     *(int *)val = 6;
+    return PAM_MYSQL_ERR_SUCCESS;
+  }
+
+  if (strcmp(newval_str, "7") == 0 || strcasecmp(newval_str, "salted_sha512") == 0) {
+    *(int *)val = 7;
     return PAM_MYSQL_ERR_SUCCESS;
   }
 
@@ -3023,6 +3034,42 @@ static pam_mysql_err_t pam_mysql_check_passwd(pam_mysql_ctx_t *ctx,
 #endif
             } break;
 
+	case 7:
+	  {
+#ifdef HAVE_PAM_MYSQL_SHA1_DATA
+	    char buf[129];
+	    buf[128]=0;
+
+	    char *salt = row[0];
+	    char *hash = strsep(&salt,":");
+
+	    int len = strlen(passwd)+strlen(salt);
+
+	    char *tmp;
+
+	    if (NULL == (tmp = xcalloc(len+1, sizeof(char)))) {
+	      syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
+	      err = PAM_MYSQL_ERR_ALLOC;
+	      goto out;
+	    }
+
+	    strcat(tmp,passwd);
+	    strcat(tmp,salt);
+
+	    pam_mysql_sha512_data((unsigned char*)tmp, len, buf);
+
+	    vresult = strcmp(hash, buf);
+	    {
+	      char *p = buf - 1;
+	      while (*(++p)) *p = '\0';
+	    }
+
+	    xfree(tmp);
+#else
+	    syslog(LOG_AUTHPRIV | LOG_ERR, PAM_MYSQL_LOG_PREFIX "non-crypt()ish SHA512 hash is not supported in this build.");
+#endif
+	  } break;
+
           default: {
              }
         }
@@ -3254,6 +3301,58 @@ static pam_mysql_err_t pam_mysql_update_passwd(pam_mysql_ctx_t *ctx, const char 
 #endif
           break;
         }
+
+    case 7:
+      {
+#ifdef HAVE_PAM_MYSQL_SHA1_DATA
+        // 1 - Allocate mem space for encrypted password: SHA512 (128 Bytes) + ':' + Salt (32 Bytes) + \0
+        if (NULL == (encrypted_passwd = xcalloc(128 + 1 + 32 + 1, sizeof(char)))) {
+          syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
+          err = PAM_MYSQL_ERR_ALLOC;
+          goto out;
+        }
+
+        // 2 - Allocate temporary buffer to hold Unencrypted password + Salt
+        int len = strlen(new_passwd) + 32;
+
+        char *tmp;
+
+        if (NULL == (tmp = xcalloc(len + 1, sizeof(char)))) {
+          syslog(LOG_AUTHPRIV | LOG_CRIT, PAM_MYSQL_LOG_PREFIX "allocation failure at " __FILE__ ":%d", __LINE__);
+          err = PAM_MYSQL_ERR_ALLOC;
+          goto out;
+        }
+
+        // 3 - Generate random salt
+        char salt[33];
+        salt[32]=0;
+
+        srandom(time(NULL));
+
+        int i;
+        for(i=0;i<32; i++)
+          salt[i]=(char)((random()/(double)RAND_MAX * 93.0) +33.0);
+
+        // 4 - Concatenate unencrypted password + salt
+        strcat(tmp,new_passwd);
+        strcat(tmp,salt);
+
+        pam_mysql_sha512_data((unsigned char*)tmp, len, encrypted_passwd);
+
+        xfree(tmp);
+
+        strcat(encrypted_passwd,":");
+        strcat(encrypted_passwd,salt);
+
+#else
+        syslog(LOG_AUTHPRIV | LOG_ERR, PAM_MYSQL_LOG_PREFIX "non-crypt()ish SHA512 hash is not supported in this build.");
+        err = PAM_MYSQL_ERR_NOTIMPL;
+        goto out;
+#endif
+        break;
+      }
+
+
       default:
         encrypted_passwd = NULL;
         break;
